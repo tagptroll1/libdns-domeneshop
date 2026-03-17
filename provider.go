@@ -16,7 +16,7 @@ type Provider struct {
 
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
 	client := newClient(p.APIToken, p.APISecret)
-	domain, err := client.getDomainByName(trimZone(zone))
+	domain, err := client.getDomainByName(zoneToApex(zone))
 	if err != nil {
 		return nil, err
 	}
@@ -25,7 +25,7 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	client := newClient(p.APIToken, p.APISecret)
-	domain, err := client.getDomainByName(trimZone(zone))
+	domain, err := client.getDomainByName(zoneToApex(zone))
 	if err != nil {
 		return nil, err
 	}
@@ -34,16 +34,24 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	client := newClient(p.APIToken, p.APISecret)
-	domain, err := client.getDomainByName(trimZone(zone))
+	domain, err := client.getDomainByName(zoneToApex(zone))
 	if err != nil {
 		return nil, err
 	}
 	return client.deleteRecords(ctx, domain, records)
 }
 
-// libdns zones are dot-terminated, domeneshop wants bare domain names
-func trimZone(zone string) string {
-	return strings.TrimSuffix(zone, ".")
+// zoneToApex extracts the registrable apex domain from a zone string.
+// Caddy may pass "_acme-challenge.status.ybmn.no." or "ybmn.no." —
+// we always want "ybmn.no" to match the domeneshop API.
+func zoneToApex(zone string) string {
+	zone = strings.TrimSuffix(zone, ".")
+	parts := strings.Split(zone, ".")
+	if len(parts) < 2 {
+		return zone
+	}
+	// Return last two labels: "ybmn.no"
+	return strings.Join(parts[len(parts)-2:], ".")
 }
 
 // Ensure interfaces are satisfied
