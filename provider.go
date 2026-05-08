@@ -25,20 +25,22 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	client := newClient(p.APIToken, p.APISecret)
-	domain, err := client.getDomainByName(zoneToApex(zone))
+	apex := zoneToApex(zone)
+	domain, err := client.getDomainByName(apex)
 	if err != nil {
 		return nil, err
 	}
-	return client.createRecords(ctx, domain, records)
+	return client.createRecords(ctx, domain, apex, records)
 }
 
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	client := newClient(p.APIToken, p.APISecret)
-	domain, err := client.getDomainByName(zoneToApex(zone))
+	apex := zoneToApex(zone)
+	domain, err := client.getDomainByName(apex)
 	if err != nil {
 		return nil, err
 	}
-	return client.deleteRecords(ctx, domain, records)
+	return client.deleteRecords(ctx, domain, apex, records)
 }
 
 // zoneToApex extracts the registrable apex domain from a zone string.
