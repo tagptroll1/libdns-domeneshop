@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/libdns/libdns"
 )
 
-const baseURL = "https://api.domeneshop.no/v0"
+// baseURLVar is the API root. It's a var (not const) so tests can swap
+// it for an httptest server URL. Not part of the public surface.
+var baseURLVar = "https://api.domeneshop.no/v0"
 
 type client struct {
 	token  string
@@ -45,7 +48,7 @@ func (c *client) do(ctx context.Context, method, path string, body any) (*http.R
 	} else {
 		buf = &bytes.Buffer{}
 	}
-	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, buf)
+	req, err := http.NewRequestWithContext(ctx, method, baseURLVar+path, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -54,20 +57,21 @@ func (c *client) do(ctx context.Context, method, path string, body any) (*http.R
 	return c.http.Do(req)
 }
 
-func (c *client) getDomainByName(name string) (*domain, error) {
-	resp, err := c.do(context.Background(), "GET", "/domains", nil)
+func (c *client) listDomains(ctx context.Context) ([]domain, error) {
+	resp, err := c.do(ctx, "GET", "/domains", nil)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var domains []domain
-	json.NewDecoder(resp.Body).Decode(&domains)
-	for _, d := range domains {
-		if d.Name == name {
-			return &d, nil
-		}
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("domeneshop list domains: %s: %s", resp.Status, bytes.TrimSpace(b))
 	}
-	return nil, fmt.Errorf("domain %q not found", name)
+	var domains []domain
+	if err := json.NewDecoder(resp.Body).Decode(&domains); err != nil {
+		return nil, fmt.Errorf("domeneshop list domains: %w", err)
+	}
+	return domains, nil
 }
 
 func (c *client) getRecords(ctx context.Context, d *domain) ([]libdns.Record, error) {
@@ -77,7 +81,9 @@ func (c *client) getRecords(ctx context.Context, d *domain) ([]libdns.Record, er
 	}
 	defer resp.Body.Close()
 	var records []dnsRecord
-	json.NewDecoder(resp.Body).Decode(&records)
+	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
+		return nil, fmt.Errorf("domeneshop list records: %w", err)
+	}
 	out := make([]libdns.Record, 0, len(records))
 	for _, r := range records {
 		out = append(out, libdns.RR{
@@ -89,35 +95,27 @@ func (c *client) getRecords(ctx context.Context, d *domain) ([]libdns.Record, er
 	return out, nil
 }
 
-func (c *client) createRecords(ctx context.Context, d *domain, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	created := make([]libdns.Record, 0, len(records))
-	for _, record := range records {
-		r := record.RR()
-		// Caddy/certmagic passes the FQDN in r.Name; the domeneshop API
-		// expects host relative to the zone apex.
-		body := dnsRecord{
-			Host: libdns.RelativeName(r.Name, zone),
-			Type: r.Type,
-			Data: r.Data,
-			TTL:  300,
-		}
-		resp, err := c.do(ctx, "POST", fmt.Sprintf("/domains/%d/dns", d.ID), body)
-		if err != nil {
-			return created, err
-		}
-		if resp.StatusCode >= 300 {
-			b, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return created, fmt.Errorf("domeneshop create %s %q: %s: %s",
-				r.Type, body.Host, resp.Status, bytes.TrimSpace(b))
-		}
-		resp.Body.Close()
-		created = append(created, r)
+func (c *client) createRecord(ctx context.Context, d *domain, zone string, r libdns.RR) (libdns.Record, error) {
+	body := dnsRecord{
+		Host: libdns.RelativeName(strings.TrimSuffix(r.Name, "."), zone),
+		Type: r.Type,
+		Data: r.Data,
+		TTL:  300,
 	}
-	return created, nil
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/domains/%d/dns", d.ID), body)
+	if err != nil {
+		return r, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return r, fmt.Errorf("domeneshop create %s %q: %s: %s",
+			r.Type, body.Host, resp.Status, bytes.TrimSpace(b))
+	}
+	return r, nil
 }
 
-func (c *client) deleteRecords(ctx context.Context, d *domain, zone string, records []libdns.Record) ([]libdns.Record, error) {
+func (c *client) deleteRecord(ctx context.Context, d *domain, zone string, r libdns.RR) (*libdns.RR, error) {
 	resp, err := c.do(ctx, "GET", fmt.Sprintf("/domains/%d/dns", d.ID), nil)
 	if err != nil {
 		return nil, err
@@ -129,27 +127,24 @@ func (c *client) deleteRecords(ctx context.Context, d *domain, zone string, reco
 	}
 	resp.Body.Close()
 
-	deleted := make([]libdns.Record, 0)
-	for _, record := range records {
-		r := record.RR()
-		host := libdns.RelativeName(r.Name, zone)
-		for _, existing := range raw {
-			if existing.Host == host && existing.Type == r.Type && existing.Data == r.Data {
-				delResp, err := c.do(ctx, "DELETE",
-					fmt.Sprintf("/domains/%d/dns/%d", d.ID, existing.ID), nil)
-				if err != nil {
-					return deleted, err
-				}
-				if delResp.StatusCode >= 300 {
-					b, _ := io.ReadAll(delResp.Body)
-					delResp.Body.Close()
-					return deleted, fmt.Errorf("domeneshop delete %d: %s: %s",
-						existing.ID, delResp.Status, bytes.TrimSpace(b))
-				}
-				delResp.Body.Close()
-				deleted = append(deleted, r)
+	host := libdns.RelativeName(strings.TrimSuffix(r.Name, "."), zone)
+	for _, existing := range raw {
+		if existing.Host == host && existing.Type == r.Type && existing.Data == r.Data {
+			delResp, err := c.do(ctx, "DELETE",
+				fmt.Sprintf("/domains/%d/dns/%d", d.ID, existing.ID), nil)
+			if err != nil {
+				return nil, err
 			}
+			if delResp.StatusCode >= 300 {
+				b, _ := io.ReadAll(delResp.Body)
+				delResp.Body.Close()
+				return nil, fmt.Errorf("domeneshop delete %d: %s: %s",
+					existing.ID, delResp.Status, bytes.TrimSpace(b))
+			}
+			delResp.Body.Close()
+			return &r, nil
 		}
 	}
-	return deleted, nil
+	// No matching record found — treat as no-op (idempotent delete).
+	return nil, nil
 }
