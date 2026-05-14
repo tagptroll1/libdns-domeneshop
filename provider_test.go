@@ -184,6 +184,45 @@ func withBaseURL(t *testing.T, url string, fn func()) {
 	fn()
 }
 
+// This reproduces the real-world certmagic call: zone="no." (the broken
+// upstream finder) and Name relative to that zone (so the ".no" tail is
+// already chopped off). The plugin must reconstruct the FQDN and still
+// find ybmn.no.
+func TestAppendRecords_RelativeNameAgainstBogusZone(t *testing.T) {
+	api := &fakeAPI{
+		t:       t,
+		domains: []domain{{ID: 42, Name: "ybmn.no"}, {ID: 7, Name: "sletteposten.no"}},
+		dns:     map[int][]dnsRecord{42: nil, 7: nil},
+		nextID:  1000,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(api.handle))
+	defer srv.Close()
+
+	withBaseURL(t, srv.URL, func() {
+		p := &Provider{APIToken: "tok", APISecret: "sec"}
+		_, err := p.AppendRecords(context.Background(), "no.", []libdns.Record{
+			libdns.RR{
+				Name: "_acme-challenge.cloud.ybmn", // relative to zone "no."
+				Type: "TXT",
+				Data: "challenge-data",
+			},
+		})
+		if err != nil {
+			t.Fatalf("AppendRecords failed: %v", err)
+		}
+		if api.lastCreated == nil {
+			t.Fatal("expected a record to be created")
+		}
+		if api.lastCreated.Host != "_acme-challenge.cloud" {
+			t.Errorf("relative host wrong: got %q, want %q",
+				api.lastCreated.Host, "_acme-challenge.cloud")
+		}
+		if len(api.dns[42]) != 1 {
+			t.Errorf("expected record under domain 42 (ybmn.no), got %d", len(api.dns[42]))
+		}
+	})
+}
+
 func TestAppendRecords_PicksRightDomainDespiteMisleadingZone(t *testing.T) {
 	api := &fakeAPI{
 		t:       t,

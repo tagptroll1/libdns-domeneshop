@@ -50,11 +50,13 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 	created := make([]libdns.Record, 0, len(records))
 	for _, rec := range records {
 		r := rec.RR()
-		d, apex := pickDomainForName(domains, r.Name)
+		fqdn, d, apex := resolveFQDN(domains, r.Name, zone)
 		if d == nil {
-			return created, fmt.Errorf("no domeneshop-managed domain matches %q", r.Name)
+			return created, fmt.Errorf("no domeneshop-managed domain matches %q (zone %q)", r.Name, zone)
 		}
-		out, err := client.createRecord(ctx, d, apex, r)
+		rAbs := r
+		rAbs.Name = fqdn
+		out, err := client.createRecord(ctx, d, apex, rAbs)
 		if err != nil {
 			return created, err
 		}
@@ -73,11 +75,13 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 	deleted := make([]libdns.Record, 0, len(records))
 	for _, rec := range records {
 		r := rec.RR()
-		d, apex := pickDomainForName(domains, r.Name)
+		fqdn, d, apex := resolveFQDN(domains, r.Name, zone)
 		if d == nil {
-			return deleted, fmt.Errorf("no domeneshop-managed domain matches %q", r.Name)
+			return deleted, fmt.Errorf("no domeneshop-managed domain matches %q (zone %q)", r.Name, zone)
 		}
-		out, err := client.deleteRecord(ctx, d, apex, r)
+		rAbs := r
+		rAbs.Name = fqdn
+		out, err := client.deleteRecord(ctx, d, apex, rAbs)
 		if err != nil {
 			return deleted, err
 		}
@@ -86,6 +90,31 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		}
 	}
 	return deleted, nil
+}
+
+// candidateFQDNs returns FQDN candidates to try matching against the owned
+// domain list. We don't trust the zone arg (it can be misleading like "no."),
+// nor do we know whether libdns passed name as already-absolute or as
+// relative-to-zone. So we try the as-is form first, then the joined form.
+func candidateFQDNs(name, zone string) []string {
+	name = strings.TrimSuffix(name, ".")
+	z := strings.TrimSuffix(zone, ".")
+	out := []string{name}
+	if z != "" && name != z && !strings.HasSuffix(name, "."+z) {
+		out = append(out, name+"."+z)
+	}
+	return out
+}
+
+// resolveFQDN picks the first candidate FQDN that has an owned domain match.
+// Returns the resolved FQDN, the matching domain, and apex.
+func resolveFQDN(domains []domain, name, zone string) (string, *domain, string) {
+	for _, c := range candidateFQDNs(name, zone) {
+		if d, apex := pickDomainForName(domains, c); d != nil {
+			return c, d, apex
+		}
+	}
+	return "", nil, ""
 }
 
 // pickDomainForName picks the registered domain whose name is the longest
