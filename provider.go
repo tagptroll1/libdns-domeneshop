@@ -65,6 +65,80 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 	return created, nil
 }
 
+// SetRecords replaces records in the zone for each (name, type) RRset.
+// For every input record, all existing records with the same relative
+// host and type are deleted, then the desired records are created. This
+// is what certmagic uses for DNS-01: it guarantees the TXT under
+// _acme-challenge.<host> always reflects the *current* challenge value,
+// even if a previous attempt left stale records behind.
+func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	client := newClient(p.APIToken, p.APISecret)
+	domains, err := client.listDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group inputs by (domain, relative-host, type) so we wipe each RRset
+	// exactly once before writing the desired records into it.
+	type rrkey struct {
+		domainID int
+		host     string
+		rtype    string
+	}
+	type bucket struct {
+		d       *domain
+		apex    string
+		host    string
+		rtype   string
+		records []libdns.RR
+	}
+	buckets := make(map[rrkey]*bucket)
+	order := []rrkey{}
+
+	for _, rec := range records {
+		r := rec.RR()
+		fqdn, d, apex := resolveFQDN(domains, r.Name, zone)
+		if d == nil {
+			return nil, fmt.Errorf("no domeneshop-managed domain matches %q (zone %q)", r.Name, zone)
+		}
+		host := libdns.RelativeName(strings.TrimSuffix(fqdn, "."), apex)
+		k := rrkey{d.ID, host, r.Type}
+		if _, ok := buckets[k]; !ok {
+			buckets[k] = &bucket{d: d, apex: apex, host: host, rtype: r.Type}
+			order = append(order, k)
+		}
+		rAbs := r
+		rAbs.Name = fqdn
+		buckets[k].records = append(buckets[k].records, rAbs)
+	}
+
+	out := make([]libdns.Record, 0, len(records))
+	for _, k := range order {
+		b := buckets[k]
+
+		existing, err := client.listRaw(ctx, b.d)
+		if err != nil {
+			return out, err
+		}
+		for _, e := range existing {
+			if e.Host == b.host && e.Type == b.rtype {
+				if err := client.deleteByID(ctx, b.d, e.ID); err != nil {
+					return out, err
+				}
+			}
+		}
+
+		for _, rAbs := range b.records {
+			created, err := client.createRecord(ctx, b.d, b.apex, rAbs)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, created)
+		}
+	}
+	return out, nil
+}
+
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	client := newClient(p.APIToken, p.APISecret)
 	domains, err := client.listDomains(ctx)
@@ -153,5 +227,6 @@ func zoneToApex(zone string) string {
 var (
 	_ libdns.RecordGetter   = (*Provider)(nil)
 	_ libdns.RecordAppender = (*Provider)(nil)
+	_ libdns.RecordSetter   = (*Provider)(nil)
 	_ libdns.RecordDeleter  = (*Provider)(nil)
 )

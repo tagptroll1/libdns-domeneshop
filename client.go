@@ -75,17 +75,12 @@ func (c *client) listDomains(ctx context.Context) ([]domain, error) {
 }
 
 func (c *client) getRecords(ctx context.Context, d *domain) ([]libdns.Record, error) {
-	resp, err := c.do(ctx, "GET", fmt.Sprintf("/domains/%d/dns", d.ID), nil)
+	raw, err := c.listRaw(ctx, d)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	var records []dnsRecord
-	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
-		return nil, fmt.Errorf("domeneshop list records: %w", err)
-	}
-	out := make([]libdns.Record, 0, len(records))
-	for _, r := range records {
+	out := make([]libdns.Record, 0, len(raw))
+	for _, r := range raw {
 		out = append(out, libdns.RR{
 			Type: r.Type,
 			Name: r.Host,
@@ -115,33 +110,51 @@ func (c *client) createRecord(ctx context.Context, d *domain, zone string, r lib
 	return r, nil
 }
 
-func (c *client) deleteRecord(ctx context.Context, d *domain, zone string, r libdns.RR) (*libdns.RR, error) {
+// listRaw returns the raw dnsRecord slice for a domain. Used by both
+// deleteRecord (content-match path) and SetRecords (RRset-wipe path).
+func (c *client) listRaw(ctx context.Context, d *domain) ([]dnsRecord, error) {
 	resp, err := c.do(ctx, "GET", fmt.Sprintf("/domains/%d/dns", d.ID), nil)
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("domeneshop list dns: %s: %s", resp.Status, bytes.TrimSpace(b))
+	}
 	var raw []dnsRecord
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		resp.Body.Close()
 		return nil, fmt.Errorf("domeneshop list dns: %w", err)
 	}
-	resp.Body.Close()
+	return raw, nil
+}
+
+// deleteByID removes a single record by its Domeneshop record ID.
+func (c *client) deleteByID(ctx context.Context, d *domain, id int) error {
+	resp, err := c.do(ctx, "DELETE", fmt.Sprintf("/domains/%d/dns/%d", d.ID, id), nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("domeneshop delete %d: %s: %s", id, resp.Status, bytes.TrimSpace(b))
+	}
+	return nil
+}
+
+func (c *client) deleteRecord(ctx context.Context, d *domain, zone string, r libdns.RR) (*libdns.RR, error) {
+	raw, err := c.listRaw(ctx, d)
+	if err != nil {
+		return nil, err
+	}
 
 	host := libdns.RelativeName(strings.TrimSuffix(r.Name, "."), zone)
 	for _, existing := range raw {
 		if existing.Host == host && existing.Type == r.Type && existing.Data == r.Data {
-			delResp, err := c.do(ctx, "DELETE",
-				fmt.Sprintf("/domains/%d/dns/%d", d.ID, existing.ID), nil)
-			if err != nil {
+			if err := c.deleteByID(ctx, d, existing.ID); err != nil {
 				return nil, err
 			}
-			if delResp.StatusCode >= 300 {
-				b, _ := io.ReadAll(delResp.Body)
-				delResp.Body.Close()
-				return nil, fmt.Errorf("domeneshop delete %d: %s: %s",
-					existing.ID, delResp.Status, bytes.TrimSpace(b))
-			}
-			delResp.Body.Close()
 			return &r, nil
 		}
 	}

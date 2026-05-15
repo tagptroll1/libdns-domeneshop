@@ -299,6 +299,62 @@ func TestDeleteRecords_RemovesMatching(t *testing.T) {
 	})
 }
 
+func TestSetRecords_WipesExistingRRsetThenCreates(t *testing.T) {
+	api := &fakeAPI{
+		t:       t,
+		domains: []domain{{ID: 42, Name: "ybmn.no"}},
+		dns: map[int][]dnsRecord{
+			42: {
+				// Two stale TXTs at the same RRset — exactly the state we
+				// hit when libdns only appended and never cleaned up.
+				{ID: 500, Host: "_acme-challenge.cloud", Type: "TXT", Data: "stale-1"},
+				{ID: 501, Host: "_acme-challenge.cloud", Type: "TXT", Data: "stale-2"},
+				// Unrelated record at a different RRset — must NOT be touched.
+				{ID: 502, Host: "www", Type: "A", Data: "10.0.0.1"},
+			},
+		},
+		nextID: 1000,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(api.handle))
+	defer srv.Close()
+
+	withBaseURL(t, srv.URL, func() {
+		p := &Provider{APIToken: "tok", APISecret: "sec"}
+		_, err := p.SetRecords(context.Background(), "ybmn.no.", []libdns.Record{
+			libdns.RR{Name: "_acme-challenge.cloud.ybmn.no.", Type: "TXT", Data: "fresh"},
+		})
+		if err != nil {
+			t.Fatalf("SetRecords failed: %v", err)
+		}
+
+		// Both stale TXTs should be gone.
+		if len(api.deletedIDs) != 2 {
+			t.Errorf("expected 2 deletes (stale TXTs), got %v", api.deletedIDs)
+		}
+
+		// Final state under ybmn.no: the A record + exactly one fresh TXT.
+		recs := api.dns[42]
+		if len(recs) != 2 {
+			t.Fatalf("expected 2 records remaining, got %d: %+v", len(recs), recs)
+		}
+		var foundFresh, foundA bool
+		for _, r := range recs {
+			if r.Host == "_acme-challenge.cloud" && r.Type == "TXT" && r.Data == "fresh" {
+				foundFresh = true
+			}
+			if r.Host == "www" && r.Type == "A" {
+				foundA = true
+			}
+		}
+		if !foundFresh {
+			t.Error("fresh TXT was not created")
+		}
+		if !foundA {
+			t.Error("unrelated A record was wrongly removed")
+		}
+	})
+}
+
 func TestAppendRecords_NoMatchingDomainErrors(t *testing.T) {
 	api := &fakeAPI{
 		t:       t,
