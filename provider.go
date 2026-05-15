@@ -54,13 +54,17 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		if d == nil {
 			return created, fmt.Errorf("no domeneshop-managed domain matches %q (zone %q)", r.Name, zone)
 		}
-		rAbs := r
-		rAbs.Name = fqdn
-		out, err := client.createRecord(ctx, d, apex, rAbs)
-		if err != nil {
+		// createRecord needs the FQDN so it can derive the apex-relative
+		// Host for the Domeneshop API. But the returned libdns.Record must
+		// keep r.Name as the caller passed it (relative to the input zone),
+		// otherwise certmagic's propagation check will AbsoluteName(...)
+		// it again and end up querying e.g. _acme-challenge.X.ybmn.no.ybmn.no.
+		apiCall := r
+		apiCall.Name = fqdn
+		if _, err := client.createRecord(ctx, d, apex, apiCall); err != nil {
 			return created, err
 		}
-		created = append(created, out)
+		created = append(created, rec)
 	}
 	return created, nil
 }
@@ -85,12 +89,20 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 		host     string
 		rtype    string
 	}
+	// Each entry pairs the FQDN-form RR we pass to the API with the
+	// original caller-supplied Record we hand back unchanged. Returning
+	// the original preserves Name's relativity to the input zone — see
+	// AppendRecords for why that matters for the propagation check.
+	type pair struct {
+		apiCall libdns.RR
+		orig    libdns.Record
+	}
 	type bucket struct {
-		d       *domain
-		apex    string
-		host    string
-		rtype   string
-		records []libdns.RR
+		d     *domain
+		apex  string
+		host  string
+		rtype string
+		pairs []pair
 	}
 	buckets := make(map[rrkey]*bucket)
 	order := []rrkey{}
@@ -107,9 +119,9 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			buckets[k] = &bucket{d: d, apex: apex, host: host, rtype: r.Type}
 			order = append(order, k)
 		}
-		rAbs := r
-		rAbs.Name = fqdn
-		buckets[k].records = append(buckets[k].records, rAbs)
+		apiCall := r
+		apiCall.Name = fqdn
+		buckets[k].pairs = append(buckets[k].pairs, pair{apiCall: apiCall, orig: rec})
 	}
 
 	out := make([]libdns.Record, 0, len(records))
@@ -128,12 +140,11 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			}
 		}
 
-		for _, rAbs := range b.records {
-			created, err := client.createRecord(ctx, b.d, b.apex, rAbs)
-			if err != nil {
+		for _, p := range b.pairs {
+			if _, err := client.createRecord(ctx, b.d, b.apex, p.apiCall); err != nil {
 				return out, err
 			}
-			out = append(out, created)
+			out = append(out, p.orig)
 		}
 	}
 	return out, nil
@@ -153,14 +164,14 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		if d == nil {
 			return deleted, fmt.Errorf("no domeneshop-managed domain matches %q (zone %q)", r.Name, zone)
 		}
-		rAbs := r
-		rAbs.Name = fqdn
-		out, err := client.deleteRecord(ctx, d, apex, rAbs)
+		apiCall := r
+		apiCall.Name = fqdn
+		out, err := client.deleteRecord(ctx, d, apex, apiCall)
 		if err != nil {
 			return deleted, err
 		}
 		if out != nil {
-			deleted = append(deleted, *out)
+			deleted = append(deleted, rec)
 		}
 	}
 	return deleted, nil
